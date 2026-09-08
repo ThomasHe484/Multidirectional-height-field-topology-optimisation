@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated optimisation output
+outputs/
+
+# Numerical output
+*.vtu
+*.vtk
+*.pvtu
+*.npz
+*.npy
+
+# Checkpoints
+*checkpoint*
+
+# SLURM / HPC output
+slurm-*.out
+
+# Temporary files
+*.tmp
+*.bak

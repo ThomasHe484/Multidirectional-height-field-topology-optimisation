@@ -1,0 +1,2501 @@
+"""
+3D selectable-height-field subtractive topology optimisation of a cantilever beam.
+
+This run is configured for a fair physical comparison with the supplied SIMP
+baseline.  The common problem definition is identical:
+
+- N-mm-MPa unit system;
+- 160 x 40 x 40 mm design domain;
+- 80 x 20 x 20 HEX8 mesh (2 mm isotropic elements);
+- aluminium: E = 70000 MPa and nu = 0.33;
+- SIMP penalty p = 3 and void stiffness ratio = 1e-6;
+- 40% original height-field nodal-volume target;
+- 100 N downward load on the 2 mm lower strip of the free end;
+- 200 maximum MMA updates and the original 0.05 normalised move limit;
+- convergence-based early stopping after a stable 10-update window.
+
+The original subtractive algorithm is retained.  Any non-empty subset of the
+six cutter-centre height fields can be selected.  Active fields start at their
+no-cut lower bound, so optimisation begins from a nearly fully solid stock.
+Inactive fields are excluded from the MMA vector and contribute an exact
+survival factor of one to the physical-density mapping.  Material is removed
+through the original processing
+chain: raw height fields -> Gaussian filter -> optional holder constraint ->
+optional ball-end swept envelope -> maximum insertion-depth clipping.  The
+original nodal-volume constraint and Gaussian kernel are also retained.
+
+To preserve the original custom MMA conditioning, its design variables remain
+in the original nondimensional height units.  A single factor of 40 mm per
+design unit converts the raw fields to physical millimetres before the Gaussian,
+holder, ball-end and density operations.  FEM coordinates and saved processed
+height fields remain physical millimetres.
+
+Available provisional cutter model (ball-end envelope disabled in the default
+configuration below):
+
+- 6 mm diameter ball-end cutter;
+- 24 mm maximum cutter-tip insertion depth;
+- 18 mm usable neck length;
+- optional 20 x 20 mm rectangular holder envelope (disabled by default).
+
+Confirm the cutter, stick-out, holder/collet envelope, and allowable insertion
+depth with the technician before claiming machine-specific manufacturability.
+No non-design region is imposed in this comparison run.
+"""
+
+import csv
+import json
+import os
+import shutil
+
+import jax
+import jax.numpy as jnp
+import numpy as onp
+import meshio
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from jax import config
+from jax_fem.problem import Problem
+from jax_fem.solver import ad_wrapper
+from jax_fem.generate_mesh import box_mesh, Mesh
+
+config.update("jax_enable_x64", True)
+
+
+# ============================================================
+# 1. Configuration
+# ============================================================
+
+# Unit system: length mm, force N, stress / E MPa = N/mm^2.
+# Match the supplied SIMP baseline mesh and physical domain exactly.
+NX, NY, NZ = 80, 20, 20
+LX, LY, LZ = 160.0, 40.0, 40.0
+
+DX = LX / NX
+DY = LY / NY
+DZ = LZ / NZ
+
+# The old dimensionless model used beta = 4 with one length unit = 40 mm.
+# Therefore beta = 4 / 40 = 0.10 mm^-1 preserves the same transition width
+# relative to the mesh after conversion to physical dimensions.
+BETA = 0.10  # mm^-1
+VOL_TARGET = 0.60
+
+P_SIMP = 3.0
+E_MAX = 70000.0  # MPa, provisional aluminium elastic modulus
+VOID_STIFFNESS_RATIO = 1.0e-6
+E_MIN = VOID_STIFFNESS_RATIO * E_MAX
+POISSON_RATIO = 0.33
+
+# Maximum update count and convergence-based early stopping.  In this custom
+# MMA, the move is applied as a fraction of each height variable's allowable
+# range.  Keep the original proposed-method value rather than forcing the SIMP
+# density-variable move limit onto a different height-variable parameterisation.
+NUM_ITERATIONS = 200
+MMA_MOVE_LIMIT = 0.05
+
+EARLY_STOPPING_ENABLED = True
+MINIMUM_ITERATIONS = 20
+CONVERGENCE_WINDOW = 10
+COMPLIANCE_RELATIVE_TOLERANCE = 1.0e-3
+MAX_PHYSICAL_DENSITY_CHANGE_TOLERANCE = 1.0e-2
+VOLUME_ABSOLUTE_TOLERANCE = 1.0e-3
+
+# Preserve the original internal MMA variable scale.  One original model unit
+# corresponds to 40 mm in the physical cantilever.
+DESIGN_TO_MM = 40.0
+
+# Original nondimensional lower bound and solid-stock initial state.
+INITIAL_HEIGHT = -1.0
+INITIAL_HEIGHT_MM = DESIGN_TO_MM * INITIAL_HEIGHT
+
+# ============================================================
+# Manufacturing-constraint switches
+# ============================================================
+
+USE_HEIGHT_FIELD_FILTER = True
+# True  = use the same 2D Gaussian filter as the reference code.
+# False = use raw, unfiltered height fields.
+
+USE_BALL_END_CUTTER = False
+# True  = convert each cutter-centre field into a ball-end swept envelope.
+# False = use an ideal zero-radius cutter field.
+
+USE_HOLDER_COLLISION = False
+# True  = apply the rectangular-holder clearance approximation.
+# False = bypass the holder-collision constraint.
+
+# Select any NON-EMPTY subset of the six directional height fields below.
+#
+#     "h_xm": cut from x = 0  towards +x
+#     "h_xp": cut from x = LX towards -x
+#     "h_ym": cut from y = 0  towards +y
+#     "h_yp": cut from y = LY towards -y
+#     "h_zm": cut from z = 0  towards +z
+#     "h_zp": cut from z = LZ towards -z
+#
+# Examples:
+#     ("h_zm",)                         one setup face
+#     ("h_zm", "h_zp")                 a two-sided z setup
+#     ("h_xm", "h_ym", "h_zm")        three positive faces
+#     ALL_HEIGHT_FIELD_NAMES            all six original fields
+ALL_HEIGHT_FIELD_NAMES = (
+    "h_xm",
+    "h_xp",
+    "h_ym",
+    "h_yp",
+    "h_zm",
+    "h_zp",
+)
+
+ACTIVE_HEIGHT_FIELDS = ("h_xm","h_xp","h_yp","h_ym","h_zm","h_zp")
+
+if len(ACTIVE_HEIGHT_FIELDS) == 0:
+    raise ValueError("At least one height field must be active.")
+
+if len(set(ACTIVE_HEIGHT_FIELDS)) != len(ACTIVE_HEIGHT_FIELDS):
+    raise ValueError("ACTIVE_HEIGHT_FIELDS contains duplicate names.")
+
+UNKNOWN_HEIGHT_FIELDS = (
+    set(ACTIVE_HEIGHT_FIELDS) - set(ALL_HEIGHT_FIELD_NAMES)
+)
+
+if UNKNOWN_HEIGHT_FIELDS:
+    raise ValueError(
+        "Unknown height-field names: "
+        + ", ".join(sorted(UNKNOWN_HEIGHT_FIELDS))
+    )
+
+# Always use the canonical order internally, regardless of the order used in
+# ACTIVE_HEIGHT_FIELDS.  This makes vector packing, output and restart files
+# deterministic.
+ACTIVE_HEIGHT_FIELDS = tuple(
+    name
+    for name in ALL_HEIGHT_FIELD_NAMES
+    if name in set(ACTIVE_HEIGHT_FIELDS)
+)
+INACTIVE_HEIGHT_FIELDS = tuple(
+    name
+    for name in ALL_HEIGHT_FIELD_NAMES
+    if name not in set(ACTIVE_HEIGHT_FIELDS)
+)
+ACTIVE_HEIGHT_FIELD_SET = frozenset(ACTIVE_HEIGHT_FIELDS)
+
+# ============================================================
+# Physical cutter and holder geometry
+# ============================================================
+
+TOOL_DIAMETER_MM = 6.0
+TOOL_RADIUS = 0.5 * TOOL_DIAMETER_MM
+
+# Maximum axial depth reached by the cutter tip from any allowed setup face.
+MAX_INSERTION_DEPTH = 24.0  # mm
+
+# Free cutting length before the optional holder envelope begins.
+TOOL_NECK_LENGTH = 18.0  # mm
+
+# Provisional transverse envelope of the holder/collet.  These parameters have
+# no effect while USE_HOLDER_COLLISION is False.
+HOLDER_SIZE_X = 20.0  # mm
+HOLDER_SIZE_Y = 20.0  # mm
+HOLDER_SIZE_Z = 20.0  # mm
+
+# When the ball-end cutter is active, the optimisation variable represents
+# ball-centre depth, so its upper bound is tip depth minus the radius.
+# With an ideal zero-radius cutter, the variable itself is the cutting depth.
+EFFECTIVE_TOOL_RADIUS = TOOL_RADIUS if USE_BALL_END_CUTTER else 0.0
+MAX_DESIGN_DEPTH_MM = max(
+    0.0,
+    MAX_INSERTION_DEPTH - EFFECTIVE_TOOL_RADIUS,
+)
+MAX_DESIGN_DEPTH = MAX_DESIGN_DEPTH_MM / DESIGN_TO_MM
+
+
+# ============================================================
+# Gaussian filter settings
+# ============================================================
+
+# Preserve the original height-field regularisation exactly: sigma = 2 cells
+# and square-kernel half-width = 3 cells.  With the present 2 mm isotropic mesh,
+# these correspond to sigma = 4 mm and half-width = 6 mm.  This is a
+# method-specific surface regulariser, not the SIMP 3D cone density filter.
+GAUSSIAN_FILTER_SIGMA_CELLS = 2.0
+GAUSSIAN_FILTER_RADIUS_CELLS = 3
+GAUSSIAN_FILTER_SIGMA_MM = GAUSSIAN_FILTER_SIGMA_CELLS * DX
+GAUSSIAN_FILTER_RADIUS_MM = GAUSSIAN_FILTER_RADIUS_CELLS * DX
+
+if not (
+    onp.isclose(DX, DY)
+    and onp.isclose(DY, DZ)
+):
+    raise ValueError(
+        "The physical Gaussian kernel currently requires an isotropic mesh."
+    )
+
+# ============================================================
+# Load settings
+# ============================================================
+
+# Match the supplied SIMP baseline load-strip definition and total load.
+LOAD_STRIP_HEIGHT = LY / NY
+
+TOTAL_APPLIED_LOAD_Y = -100.0  # N
+
+constraint_label = (
+    f"filter_{int(USE_HEIGHT_FIELD_FILTER)}"
+    f"_ball_{int(USE_BALL_END_CUTTER)}"
+    f"_holder_{int(USE_HOLDER_COLLISION)}"
+)
+
+direction_label = "dirs_" + "_".join(
+    name[2:]
+    for name in ACTIVE_HEIGHT_FIELDS
+)
+
+RUN_NAME = (
+    "heightfield_selectable_dirs_aluminium_mm_nondim_mma_"
+    "tool6mm_depth24mm_earlystop200_v5"
+)
+
+OUTPUT_DIR = os.path.join(
+    "/home/hy/projects/research_project",
+    f"{RUN_NAME}_{direction_label}_{constraint_label}",
+)
+
+CLEAR_OLD_RESULTS = True
+
+
+# ============================================================
+# 2. Minimal MMA optimiser
+# ============================================================
+
+def update_asymptotes(
+    iteration,
+    x,
+    x_old,
+    x_older,
+    low,
+    upp,
+    xmin,
+    xmax,
+    asy_init=0.5,
+    asy_incr=1.2,
+    asy_decr=0.7,
+):
+    x = onp.asarray(x, dtype=float)
+    x_old = onp.asarray(x_old, dtype=float)
+    x_older = onp.asarray(x_older, dtype=float)
+
+    low = onp.asarray(low, dtype=float)
+    upp = onp.asarray(upp, dtype=float)
+
+    xmin = onp.asarray(xmin, dtype=float)
+    xmax = onp.asarray(xmax, dtype=float)
+
+    design_range = onp.maximum(xmax - xmin, 1e-12)
+
+    if iteration < 2:
+        low_new = x - asy_init * design_range
+        upp_new = x + asy_init * design_range
+    else:
+        change_product = (x - x_old) * (x_old - x_older)
+
+        factor = onp.ones_like(x)
+        factor = onp.where(change_product > 0.0, asy_incr, factor)
+        factor = onp.where(change_product < 0.0, asy_decr, factor)
+
+        low_new = x - factor * (x_old - low)
+        upp_new = x + factor * (upp - x_old)
+
+        low_new = onp.maximum(low_new, x - 10.0 * design_range)
+        upp_new = onp.minimum(upp_new, x + 10.0 * design_range)
+
+        low_new = onp.minimum(low_new, x - 0.01 * design_range)
+        upp_new = onp.maximum(upp_new, x + 0.01 * design_range)
+
+    return low_new, upp_new
+
+
+def get_mma_coefficients(
+    x,
+    gradient,
+    low,
+    upp,
+    regularization=1e-5,
+):
+    distance_to_upper = onp.maximum(upp - x, 1e-12)
+    distance_to_lower = onp.maximum(x - low, 1e-12)
+
+    abs_gradient = onp.abs(gradient)
+    stabilizer = regularization * onp.maximum(abs_gradient, 1.0)
+
+    p = (
+        (onp.maximum(gradient, 0.0) + stabilizer)
+        * distance_to_upper**2
+    )
+
+    q = (
+        (onp.maximum(-gradient, 0.0) + stabilizer)
+        * distance_to_lower**2
+    )
+
+    return p, q
+
+
+def get_x_from_lambda(
+    lam,
+    p0,
+    q0,
+    p1,
+    q1,
+    low,
+    upp,
+    alpha,
+    beta,
+):
+    p = onp.maximum(p0 + lam * p1, 1e-30)
+    q = onp.maximum(q0 + lam * q1, 1e-30)
+
+    sqrt_p = onp.sqrt(p)
+    sqrt_q = onp.sqrt(q)
+
+    x_new = (
+        sqrt_p * low
+        + sqrt_q * upp
+    ) / (sqrt_p + sqrt_q)
+
+    x_new = onp.clip(x_new, alpha, beta)
+
+    return x_new
+
+
+def mma_subproblem(
+    x,
+    f0,
+    df0,
+    f1,
+    df1,
+    xmin,
+    xmax,
+    low,
+    upp,
+    move=0.03,
+    dual_tolerance=1e-9,
+    max_dual_iterations=100,
+):
+    del f0
+
+    x = onp.asarray(x, dtype=float)
+    df0 = onp.asarray(df0, dtype=float)
+    df1 = onp.asarray(df1, dtype=float)
+
+    xmin = onp.asarray(xmin, dtype=float)
+    xmax = onp.asarray(xmax, dtype=float)
+
+    low = onp.asarray(low, dtype=float)
+    upp = onp.asarray(upp, dtype=float)
+
+    arrays = [x, df0, df1, xmin, xmax, low, upp]
+
+    if not all(arr.shape == x.shape for arr in arrays):
+        raise ValueError("All MMA arrays must have the same shape.")
+
+    if not onp.all(onp.isfinite(x)):
+        raise ValueError("Current design contains NaN or Inf.")
+
+    if not onp.all(onp.isfinite(df0)):
+        raise ValueError("Objective gradient contains NaN or Inf.")
+
+    if not onp.all(onp.isfinite(df1)):
+        raise ValueError("Constraint gradient contains NaN or Inf.")
+
+    if not onp.isfinite(f1):
+        raise ValueError("Constraint value contains NaN or Inf.")
+
+    design_range = onp.maximum(xmax - xmin, 1e-12)
+
+    alpha = onp.maximum.reduce(
+        [
+            xmin,
+            x - move * design_range,
+            low + 0.1 * (x - low),
+        ]
+    )
+
+    beta = onp.minimum.reduce(
+        [
+            xmax,
+            x + move * design_range,
+            upp - 0.1 * (upp - x),
+        ]
+    )
+
+    invalid_bounds = alpha >= beta
+    midpoint = 0.5 * (alpha + beta)
+
+    alpha = onp.where(
+        invalid_bounds,
+        midpoint - 5e-7 * design_range,
+        alpha,
+    )
+
+    beta = onp.where(
+        invalid_bounds,
+        midpoint + 5e-7 * design_range,
+        beta,
+    )
+
+    alpha = onp.maximum(alpha, xmin)
+    beta = onp.minimum(beta, xmax)
+
+    p0, q0 = get_mma_coefficients(
+        x,
+        df0,
+        low,
+        upp,
+    )
+
+    p1, q1 = get_mma_coefficients(
+        x,
+        df1,
+        low,
+        upp,
+    )
+
+    distance_to_upper = onp.maximum(upp - x, 1e-12)
+    distance_to_lower = onp.maximum(x - low, 1e-12)
+
+    constraint_constant = (
+        onp.sum(
+            p1 / distance_to_upper
+            + q1 / distance_to_lower
+        )
+        - float(f1)
+    )
+
+    def approximate_constraint(x_trial):
+        return (
+            onp.sum(
+                p1 / onp.maximum(upp - x_trial, 1e-12)
+                + q1 / onp.maximum(x_trial - low, 1e-12)
+            )
+            - constraint_constant
+        )
+
+    x_lambda_zero = get_x_from_lambda(
+        0.0,
+        p0,
+        q0,
+        p1,
+        q1,
+        low,
+        upp,
+        alpha,
+        beta,
+    )
+
+    if approximate_constraint(x_lambda_zero) <= 0.0:
+        return x_lambda_zero
+
+    lambda_low = 0.0
+    lambda_high = 1.0
+
+    x_high = get_x_from_lambda(
+        lambda_high,
+        p0,
+        q0,
+        p1,
+        q1,
+        low,
+        upp,
+        alpha,
+        beta,
+    )
+
+    feasible_lambda_found = False
+
+    for _ in range(60):
+        if approximate_constraint(x_high) <= 0.0:
+            feasible_lambda_found = True
+            break
+
+        lambda_high *= 10.0
+
+        x_high = get_x_from_lambda(
+            lambda_high,
+            p0,
+            q0,
+            p1,
+            q1,
+            low,
+            upp,
+            alpha,
+            beta,
+        )
+
+    if not feasible_lambda_found:
+        return x_high
+
+    x_middle = x_high
+
+    for _ in range(max_dual_iterations):
+        lambda_middle = 0.5 * (lambda_low + lambda_high)
+
+        x_middle = get_x_from_lambda(
+            lambda_middle,
+            p0,
+            q0,
+            p1,
+            q1,
+            low,
+            upp,
+            alpha,
+            beta,
+        )
+
+        constraint_value = approximate_constraint(x_middle)
+
+        if abs(constraint_value) <= dual_tolerance:
+            break
+
+        if constraint_value > 0.0:
+            lambda_low = lambda_middle
+        else:
+            lambda_high = lambda_middle
+
+    return x_middle
+
+
+# ============================================================
+# 3. Linear elastic material model
+# ============================================================
+
+class DensityElasticity(Problem):
+
+    def __init__(self, *args, **kwargs):
+        self.surface_maps = kwargs.pop("surface_maps")
+        super().__init__(*args, **kwargs)
+
+    def custom_init(self):
+        self.fe = self.fes[0]
+        self.fe.flex_inds = jnp.arange(len(self.fe.cells))
+
+    def get_tensor_map(self):
+
+        def stress(u_grad, rho):
+            rho_value = jnp.clip(rho[0], 0.0, 1.0)
+
+            youngs_modulus = (
+                E_MIN
+                + (E_MAX - E_MIN) * rho_value**P_SIMP
+            )
+
+            mu = youngs_modulus / (2.0 * (1.0 + POISSON_RATIO))
+
+            lmbda = (
+                youngs_modulus * POISSON_RATIO
+                / (
+                    (1.0 + POISSON_RATIO)
+                    * (1.0 - 2.0 * POISSON_RATIO)
+                )
+            )
+
+            epsilon = 0.5 * (u_grad + u_grad.T)
+
+            sigma = (
+                lmbda * jnp.trace(epsilon) * jnp.eye(3)
+                + 2.0 * mu * epsilon
+            )
+
+            return sigma
+
+        return stress
+
+    def set_params(self, params):
+        if params.ndim == 1:
+            params = params[:, None]
+
+        num_quads = self.fes[0].num_quads
+
+        self.internal_vars = [
+            jnp.repeat(
+                params[:, None, :],
+                num_quads,
+                axis=1,
+            )
+        ]
+
+    def get_surface_maps(self):
+        return self.surface_maps
+
+    def compute_compliance(self, sol):
+        """
+        Standard compliance definition:
+
+            C = integral_Gamma t . u dGamma
+
+        This matches the SIMP baseline implementation.
+
+        JAX-FEM surface-map sign convention:
+        physical traction = -surface_map.
+        """
+
+        boundary_inds = self.boundary_inds_list[0]
+
+        _, nanson_scale = self.fe.get_face_shape_grads(boundary_inds)
+
+        # Shape:
+        # (number_of_loaded_faces, 1, nodes_per_face, 3)
+        u_face_nodes = (
+            sol[self.fe.cells][boundary_inds[:, 0]][:, None, :, :]
+            * self.fe.face_shape_vals[
+                boundary_inds[:, 1]
+            ][:, :, :, None]
+        )
+
+        # Shape:
+        # (number_of_loaded_faces, face_quadrature_points, 3)
+        u_face = jnp.sum(u_face_nodes, axis=2)
+
+        subset_quad_points = self.physical_surface_quad_points[0]
+
+        neumann_fn = self.get_surface_maps()[0]
+
+        # Recover the real physical traction.
+        traction = -jax.vmap(
+            jax.vmap(neumann_fn)
+        )(u_face, subset_quad_points)
+
+        compliance = jnp.sum(
+            traction * u_face * nanson_scale[:, :, None]
+        )
+
+        return compliance
+
+
+# ============================================================
+# 4. Height field dimensions and split functions
+# ============================================================
+
+def get_field_sizes():
+    # x-direction fields are on y-z planes.
+    num_x = (NY + 1) * (NZ + 1)
+
+    # y-direction fields are on x-z planes.
+    num_y = (NX + 1) * (NZ + 1)
+
+    # z-direction fields are on x-y planes.
+    num_z = (NX + 1) * (NY + 1)
+
+    return num_x, num_y, num_z
+
+
+def get_field_shapes():
+    """Return the fixed grid shape of each directional height field."""
+
+    return {
+        "h_xm": (NY + 1, NZ + 1),
+        "h_xp": (NY + 1, NZ + 1),
+        "h_ym": (NX + 1, NZ + 1),
+        "h_yp": (NX + 1, NZ + 1),
+        "h_zm": (NX + 1, NY + 1),
+        "h_zp": (NX + 1, NY + 1),
+    }
+
+
+def get_num_active_design_variables():
+    """Number of MMA variables after inactive fields have been removed."""
+
+    field_shapes = get_field_shapes()
+
+    return int(
+        sum(
+            onp.prod(field_shapes[name])
+            for name in ACTIVE_HEIGHT_FIELDS
+        )
+    )
+
+
+def split_design_variables(x_flat):
+    """
+    Unpack only active MMA variables and reconstruct a six-field tuple.
+
+    Inactive fields are represented by the no-cut lower-bound field for output
+    and manufacturing processing.  They are later assigned an exact survival
+    factor of one in the density mapping, so they cannot remove material.
+    """
+
+    field_shapes = get_field_shapes()
+    fields = {}
+    i = 0
+
+    for name in ALL_HEIGHT_FIELD_NAMES:
+        shape = field_shapes[name]
+
+        if name in ACTIVE_HEIGHT_FIELD_SET:
+            number_of_variables = int(onp.prod(shape))
+            fields[name] = x_flat[
+                i:i + number_of_variables
+            ].reshape(shape)
+            i += number_of_variables
+        else:
+            fields[name] = jnp.full(
+                shape,
+                INITIAL_HEIGHT,
+                dtype=x_flat.dtype,
+            )
+
+    if i != x_flat.size:
+        raise ValueError(
+            "Packed height-field vector has an unexpected length: "
+            f"used {i}, received {x_flat.size}."
+        )
+
+    return tuple(
+        fields[name]
+        for name in ALL_HEIGHT_FIELD_NAMES
+    )
+
+
+def initialise_design_variables():
+    return jnp.full(
+        get_num_active_design_variables(),
+        INITIAL_HEIGHT,
+    )
+
+
+def create_design_bounds():
+    """
+    Preserve the manufacturing-code maximum insertion-depth logic.
+
+    The physical ball-centre or ideal-cutting upper depth is divided by
+    DESIGN_TO_MM so that MMA sees the original nondimensional bounds.
+    """
+
+    total_num_design_variables = get_num_active_design_variables()
+
+    xmin = onp.full(total_num_design_variables, INITIAL_HEIGHT)
+    xmax = onp.full(total_num_design_variables, MAX_DESIGN_DEPTH)
+
+    return xmin, xmax
+
+
+# ============================================================
+# 5. Differentiable 2D Gaussian filter
+# ============================================================
+
+def make_gaussian_kernel_2d(
+    sigma_cells,
+    radius_cells,
+):
+    """
+    Build the original normalised separable 2D Gaussian kernel.
+    """
+
+    offsets = jnp.arange(
+        -radius_cells,
+        radius_cells + 1,
+        dtype=jnp.float64,
+    )
+
+    kernel_1d = jnp.exp(
+        -0.5 * (offsets / sigma_cells)**2
+    )
+
+    kernel_1d = kernel_1d / jnp.sum(kernel_1d)
+
+    kernel_2d = jnp.outer(
+        kernel_1d,
+        kernel_1d,
+    )
+
+    return kernel_2d / jnp.sum(kernel_2d)
+
+
+GAUSSIAN_KERNEL_2D = make_gaussian_kernel_2d(
+    GAUSSIAN_FILTER_SIGMA_CELLS,
+    GAUSSIAN_FILTER_RADIUS_CELLS,
+)
+
+
+def gaussian_filter_2d(height_field):
+    """
+    Apply an edge-padded, differentiable Gaussian filter.
+    """
+
+    radius = GAUSSIAN_FILTER_RADIUS_CELLS
+
+    padded_field = jnp.pad(
+        height_field,
+        ((radius, radius), (radius, radius)),
+        mode="edge",
+    )
+
+    filtered_field = jax.scipy.signal.convolve(
+        padded_field,
+        GAUSSIAN_KERNEL_2D,
+        mode="valid",
+    )
+
+    return filtered_field
+
+
+# ============================================================
+# 6. Optional holder and ball-end manufacturing constraints
+# ============================================================
+
+def rectangular_min_filter_2d(
+    height_field,
+    half_width_0_cells,
+    half_width_1_cells,
+):
+    """Return the shallowest depth inside a rectangular holder footprint."""
+
+    window_shape = (
+        2 * half_width_0_cells + 1,
+        2 * half_width_1_cells + 1,
+    )
+
+    return jax.lax.reduce_window(
+        height_field,
+        jnp.inf,
+        jax.lax.min,
+        window_shape,
+        (1, 1),
+        "SAME",
+    )
+
+
+def apply_rectangular_holder_constraint(
+    height_field,
+    spacing_0,
+    spacing_1,
+    holder_size_0,
+    holder_size_1,
+    neck_length,
+):
+    """Apply the original rectangular-holder clearance approximation."""
+
+    half_width_0_cells = int(
+        onp.ceil(0.5 * holder_size_0 / spacing_0)
+    )
+    half_width_1_cells = int(
+        onp.ceil(0.5 * holder_size_1 / spacing_1)
+    )
+
+    local_shallowest = rectangular_min_filter_2d(
+        height_field,
+        half_width_0_cells,
+        half_width_1_cells,
+    )
+
+    return jnp.minimum(
+        height_field,
+        local_shallowest + neck_length,
+    )
+
+
+def ball_end_swept_depth(
+    tool_centre_field,
+    tool_radius,
+    spacing_0,
+    spacing_1,
+):
+    """Convert a ball-centre field into the physical swept cutting depth."""
+
+    n0, n1 = tool_centre_field.shape
+
+    radius_cells_0 = int(onp.ceil(tool_radius / spacing_0))
+    radius_cells_1 = int(onp.ceil(tool_radius / spacing_1))
+
+    padded = jnp.pad(
+        tool_centre_field,
+        ((radius_cells_0, radius_cells_0),
+         (radius_cells_1, radius_cells_1)),
+        mode="constant",
+        constant_values=-1.0e12,
+    )
+
+    swept = jnp.full_like(tool_centre_field, -1.0e12)
+
+    for offset_0 in range(-radius_cells_0, radius_cells_0 + 1):
+        for offset_1 in range(-radius_cells_1, radius_cells_1 + 1):
+            lateral_distance = onp.sqrt(
+                (offset_0 * spacing_0) ** 2
+                + (offset_1 * spacing_1) ** 2
+            )
+
+            if lateral_distance <= tool_radius + 1.0e-12:
+                sphere_depth = onp.sqrt(
+                    max(tool_radius ** 2 - lateral_distance ** 2, 0.0)
+                )
+
+                candidate_centres = padded[
+                    radius_cells_0 + offset_0:
+                    radius_cells_0 + offset_0 + n0,
+                    radius_cells_1 + offset_1:
+                    radius_cells_1 + offset_1 + n1,
+                ]
+
+                swept = jnp.maximum(
+                    swept,
+                    candidate_centres + sphere_depth,
+                )
+
+    return swept
+
+
+def get_height_fields_for_density(x_flat):
+    """
+    Apply the original manufacturing chain without changing its order:
+
+        raw nondimensional fields
+        -> convert once to physical millimetres
+        -> optional Gaussian filter
+        -> optional rectangular-holder constraint
+        -> optional ball-end swept envelope
+        -> maximum insertion-depth clipping
+    """
+
+    fields_nondimensional = split_design_variables(x_flat)
+
+    # This linear conversion restores the original MMA variable range while
+    # keeping every manufacturing operation in physical millimetres.
+    fields = tuple(
+        DESIGN_TO_MM * field
+        for field in fields_nondimensional
+    )
+
+    if USE_HEIGHT_FIELD_FILTER:
+        fields = tuple(gaussian_filter_2d(field) for field in fields)
+
+    h_xm, h_xp, h_ym, h_yp, h_zm, h_zp = fields
+
+    dx = LX / NX
+    dy = LY / NY
+    dz = LZ / NZ
+
+    if USE_HOLDER_COLLISION and "h_xm" in ACTIVE_HEIGHT_FIELD_SET:
+        h_xm = apply_rectangular_holder_constraint(
+            h_xm, dy, dz, HOLDER_SIZE_Y, HOLDER_SIZE_Z, TOOL_NECK_LENGTH
+        )
+
+    if USE_HOLDER_COLLISION and "h_xp" in ACTIVE_HEIGHT_FIELD_SET:
+        h_xp = apply_rectangular_holder_constraint(
+            h_xp, dy, dz, HOLDER_SIZE_Y, HOLDER_SIZE_Z, TOOL_NECK_LENGTH
+        )
+
+    if USE_HOLDER_COLLISION and "h_ym" in ACTIVE_HEIGHT_FIELD_SET:
+        h_ym = apply_rectangular_holder_constraint(
+            h_ym, dx, dz, HOLDER_SIZE_X, HOLDER_SIZE_Z, TOOL_NECK_LENGTH
+        )
+
+    if USE_HOLDER_COLLISION and "h_yp" in ACTIVE_HEIGHT_FIELD_SET:
+        h_yp = apply_rectangular_holder_constraint(
+            h_yp, dx, dz, HOLDER_SIZE_X, HOLDER_SIZE_Z, TOOL_NECK_LENGTH
+        )
+
+    if USE_HOLDER_COLLISION and "h_zm" in ACTIVE_HEIGHT_FIELD_SET:
+        h_zm = apply_rectangular_holder_constraint(
+            h_zm, dx, dy, HOLDER_SIZE_X, HOLDER_SIZE_Y, TOOL_NECK_LENGTH
+        )
+
+    if USE_HOLDER_COLLISION and "h_zp" in ACTIVE_HEIGHT_FIELD_SET:
+        h_zp = apply_rectangular_holder_constraint(
+            h_zp, dx, dy, HOLDER_SIZE_X, HOLDER_SIZE_Y, TOOL_NECK_LENGTH
+        )
+
+    if USE_BALL_END_CUTTER and "h_xm" in ACTIVE_HEIGHT_FIELD_SET:
+        h_xm = ball_end_swept_depth(h_xm, TOOL_RADIUS, dy, dz)
+
+    if USE_BALL_END_CUTTER and "h_xp" in ACTIVE_HEIGHT_FIELD_SET:
+        h_xp = ball_end_swept_depth(h_xp, TOOL_RADIUS, dy, dz)
+
+    if USE_BALL_END_CUTTER and "h_ym" in ACTIVE_HEIGHT_FIELD_SET:
+        h_ym = ball_end_swept_depth(h_ym, TOOL_RADIUS, dx, dz)
+
+    if USE_BALL_END_CUTTER and "h_yp" in ACTIVE_HEIGHT_FIELD_SET:
+        h_yp = ball_end_swept_depth(h_yp, TOOL_RADIUS, dx, dz)
+
+    if USE_BALL_END_CUTTER and "h_zm" in ACTIVE_HEIGHT_FIELD_SET:
+        h_zm = ball_end_swept_depth(h_zm, TOOL_RADIUS, dx, dy)
+
+    if USE_BALL_END_CUTTER and "h_zp" in ACTIVE_HEIGHT_FIELD_SET:
+        h_zp = ball_end_swept_depth(h_zp, TOOL_RADIUS, dx, dy)
+
+    return tuple(
+        jnp.minimum(field, MAX_INSERTION_DEPTH)
+        for field in (h_xm, h_xp, h_ym, h_yp, h_zm, h_zp)
+    )
+
+
+
+# ============================================================
+# 7. Height-field to density mapping
+# ============================================================
+
+def compute_density_from_six_height_fields(
+    h_fields,
+    points,
+):
+    """
+    Convert the six processed cutting-depth fields into nodal density.
+
+    Depending on the switches, a field is either an ideal cutting-depth
+    field or a manufacturable ball-end swept-depth field.
+    """
+
+    h_xm, h_xp, h_ym, h_yp, h_zm, h_zp = h_fields
+
+    px = points[:, 0]
+    py = points[:, 1]
+    pz = points[:, 2]
+
+    # Coordinates for interpolation on y-z planes.
+    hx_coords = jnp.stack(
+        [
+            py / LY * NY,
+            pz / LZ * NZ,
+        ]
+    )
+
+    # Coordinates for interpolation on x-z planes.
+    hy_coords = jnp.stack(
+        [
+            px / LX * NX,
+            pz / LZ * NZ,
+        ]
+    )
+
+    # Coordinates for interpolation on x-y planes.
+    hz_coords = jnp.stack(
+        [
+            px / LX * NX,
+            py / LY * NY,
+        ]
+    )
+
+    hxm = jax.scipy.ndimage.map_coordinates(
+        h_xm,
+        hx_coords,
+        order=1,
+        mode="nearest",
+    )
+
+    hxp = jax.scipy.ndimage.map_coordinates(
+        h_xp,
+        hx_coords,
+        order=1,
+        mode="nearest",
+    )
+
+    hym = jax.scipy.ndimage.map_coordinates(
+        h_ym,
+        hy_coords,
+        order=1,
+        mode="nearest",
+    )
+
+    hyp = jax.scipy.ndimage.map_coordinates(
+        h_yp,
+        hy_coords,
+        order=1,
+        mode="nearest",
+    )
+
+    hzm = jax.scipy.ndimage.map_coordinates(
+        h_zm,
+        hz_coords,
+        order=1,
+        mode="nearest",
+    )
+
+    hzp = jax.scipy.ndimage.map_coordinates(
+        h_zp,
+        hz_coords,
+        order=1,
+        mode="nearest",
+    )
+
+    # r approximately equals 0 if this point is removed.
+    # r approximately equals 1 if this point remains.
+    r_xm = 0.5 * (
+        jnp.tanh(BETA * (px - hxm)) + 1.0
+    )
+
+    r_xp = 0.5 * (
+        jnp.tanh(BETA * ((LX - px) - hxp)) + 1.0
+    )
+
+    r_ym = 0.5 * (
+        jnp.tanh(BETA * (py - hym)) + 1.0
+    )
+
+    r_yp = 0.5 * (
+        jnp.tanh(BETA * ((LY - py) - hyp)) + 1.0
+    )
+
+    r_zm = 0.5 * (
+        jnp.tanh(BETA * (pz - hzm)) + 1.0
+    )
+
+    r_zp = 0.5 * (
+        jnp.tanh(BETA * ((LZ - pz) - hzp)) + 1.0
+    )
+
+    # Material remains only if it survives every ACTIVE directional cut.
+    # Inactive directions contribute exactly one rather than an approximate
+    # no-cut tanh value.  This makes disabling a field mathematically exact.
+    survival_fields = {
+        "h_xm": r_xm,
+        "h_xp": r_xp,
+        "h_ym": r_ym,
+        "h_yp": r_yp,
+        "h_zm": r_zm,
+        "h_zp": r_zp,
+    }
+
+    rho = jnp.ones_like(px)
+
+    for name in ACTIVE_HEIGHT_FIELDS:
+        rho = rho * survival_fields[name]
+
+    return rho
+
+
+# ============================================================
+# 7. VTU and height field output
+# ============================================================
+
+def save_vtu(
+    filename,
+    mesh,
+    mesh_io,
+    rho_nodes,
+    rho_cells,
+    displacement,
+):
+    meshio.write_points_cells(
+        filename,
+        mesh.points,
+        mesh_io.cells,
+        point_data={
+            "rho": onp.asarray(
+                rho_nodes,
+                dtype=float,
+            ),
+            "displacement": onp.asarray(
+                displacement,
+                dtype=float,
+            ),
+        },
+        cell_data={
+            "rho_cell": [
+                onp.asarray(
+                    rho_cells,
+                    dtype=float,
+                )
+            ]
+        },
+    )
+
+
+def save_height_fields_plot(
+    output_dir,
+    iteration,
+    x_flat,
+):
+    """
+    Save all six height-field panels, marking inactive fields explicitly, as:
+
+        height_fields_iter_XXX.png
+        height_fields_iter_XXX.npz
+    """
+
+    h_xm, h_xp, h_ym, h_yp, h_zm, h_zp = (
+        get_height_fields_for_density(x_flat)
+    )
+
+    fields = [
+        (
+            "h_xm: cut from x = 0",
+            h_xm,
+            "y coordinate (mm)",
+            "z coordinate (mm)",
+            [0.0, LY, 0.0, LZ],
+            MAX_INSERTION_DEPTH,
+        ),
+        (
+            "h_xp: cut from x = LX",
+            h_xp,
+            "y coordinate (mm)",
+            "z coordinate (mm)",
+            [0.0, LY, 0.0, LZ],
+            MAX_INSERTION_DEPTH,
+        ),
+        (
+            "h_ym: cut from y = 0",
+            h_ym,
+            "x coordinate (mm)",
+            "z coordinate (mm)",
+            [0.0, LX, 0.0, LZ],
+            MAX_INSERTION_DEPTH,
+        ),
+        (
+            "h_yp: cut from y = LY",
+            h_yp,
+            "x coordinate (mm)",
+            "z coordinate (mm)",
+            [0.0, LX, 0.0, LZ],
+            MAX_INSERTION_DEPTH,
+        ),
+        (
+            "h_zm: cut from z = 0",
+            h_zm,
+            "x coordinate (mm)",
+            "y coordinate (mm)",
+            [0.0, LX, 0.0, LY],
+            MAX_INSERTION_DEPTH,
+        ),
+        (
+            "h_zp: cut from z = LZ",
+            h_zp,
+            "x coordinate (mm)",
+            "y coordinate (mm)",
+            [0.0, LX, 0.0, LY],
+            MAX_INSERTION_DEPTH,
+        ),
+    ]
+
+    fig, axes = plt.subplots(
+        2,
+        3,
+        figsize=(16, 8.5),
+    )
+
+    axes = axes.ravel()
+
+    for name, ax, (
+        title,
+        field,
+        xlabel,
+        ylabel,
+        extent,
+        max_depth,
+    ) in zip(ALL_HEIGHT_FIELD_NAMES, axes, fields):
+        field_np = onp.asarray(
+            field,
+            dtype=float,
+        )
+
+        image = ax.imshow(
+            field_np.T,
+            origin="lower",
+            aspect="auto",
+            extent=extent,
+            vmin=INITIAL_HEIGHT_MM,
+            vmax=max_depth,
+        )
+
+        if name in ACTIVE_HEIGHT_FIELD_SET:
+            ax.set_title(title + " [ACTIVE]")
+        else:
+            ax.set_title(title + " [INACTIVE — no cutting]")
+            ax.set_facecolor("0.92")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+
+        colorbar = fig.colorbar(
+            image,
+            ax=ax,
+        )
+
+        colorbar.set_label("Processed cutting depth (mm)")
+
+    filter_label = "filtered" if USE_HEIGHT_FIELD_FILTER else "unfiltered"
+    ball_label = "ball-end" if USE_BALL_END_CUTTER else "zero-radius"
+    holder_label = "holder-on" if USE_HOLDER_COLLISION else "holder-off"
+
+    fig.suptitle(
+        f"Selectable {filter_label}, {ball_label}, {holder_label} fields "
+        f"— Iteration {iteration:03d}",
+        fontsize=16,
+    )
+
+    fig.tight_layout(
+        rect=[0.0, 0.0, 1.0, 0.95]
+    )
+
+    png_path = os.path.join(
+        output_dir,
+        f"height_fields_iter_{iteration:03d}.png",
+    )
+
+    fig.savefig(
+        png_path,
+        dpi=200,
+        bbox_inches="tight",
+    )
+
+    plt.close(fig)
+
+    npz_path = os.path.join(
+        output_dir,
+        f"height_fields_iter_{iteration:03d}.npz",
+    )
+
+    onp.savez(
+        npz_path,
+        h_xm=onp.asarray(h_xm, dtype=float),
+        h_xp=onp.asarray(h_xp, dtype=float),
+        h_ym=onp.asarray(h_ym, dtype=float),
+        h_yp=onp.asarray(h_yp, dtype=float),
+        h_zm=onp.asarray(h_zm, dtype=float),
+        h_zp=onp.asarray(h_zp, dtype=float),
+        active_height_fields=onp.asarray(ACTIVE_HEIGHT_FIELDS),
+        inactive_height_fields=onp.asarray(INACTIVE_HEIGHT_FIELDS),
+    )
+
+
+
+# ============================================================
+# 8. History and convergence output helpers
+# ============================================================
+
+history = []
+
+
+def write_history_csv(path, history_data):
+    """Rewrite and flush the complete iteration history after each update."""
+
+    if len(history_data) == 0:
+        return
+
+    headers = list(history_data[0].keys())
+
+    with open(path, "w", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(history_data)
+        csv_file.flush()
+        os.fsync(csv_file.fileno())
+
+
+def write_json_atomic(path, payload):
+    """Write JSON through a temporary file so the previous file stays valid."""
+
+    temporary_path = path + ".tmp"
+
+    with open(temporary_path, "w", encoding="utf-8") as json_file:
+        json.dump(payload, json_file, indent=2)
+        json_file.flush()
+        os.fsync(json_file.fileno())
+
+    os.replace(temporary_path, path)
+
+
+def save_mma_checkpoint(
+    path,
+    completed_iteration,
+    curr_x,
+    x_old,
+    x_older,
+    lower_asymptotes,
+    upper_asymptotes,
+    rho_cells,
+    compliance,
+):
+    """Atomically save the complete state required for a later MMA restart."""
+
+    temporary_path = path + ".tmp.npz"
+
+    onp.savez(
+        temporary_path,
+        completed_iteration=onp.asarray(completed_iteration, dtype=onp.int64),
+        curr_x=onp.asarray(curr_x, dtype=float),
+        x_old=onp.asarray(x_old, dtype=float),
+        x_older=onp.asarray(x_older, dtype=float),
+        lower_asymptotes=onp.asarray(lower_asymptotes, dtype=float),
+        upper_asymptotes=onp.asarray(upper_asymptotes, dtype=float),
+        rho_cells=onp.asarray(rho_cells, dtype=float),
+        compliance_N_mm=onp.asarray(compliance, dtype=float),
+        design_to_mm=onp.asarray(DESIGN_TO_MM, dtype=float),
+        internal_height_units=onp.asarray("nondimensional"),
+    )
+
+    os.replace(temporary_path, path)
+
+
+def assess_convergence(history_data):
+    """Assess a consecutive window of updated physical designs."""
+
+    if len(history_data) == 0:
+        return {
+            "converged": False,
+            "enough_history": False,
+            "criteria": {},
+            "observed": {},
+            "individual_checks": {},
+        }
+
+    enough_history = bool(
+        history_data[-1]["iteration"] >= MINIMUM_ITERATIONS
+        and len(history_data) >= CONVERGENCE_WINDOW
+    )
+
+    if enough_history:
+        recent_rows = history_data[-CONVERGENCE_WINDOW:]
+
+        recent_relative_changes = [
+            abs(row["relative_compliance_change"])
+            for row in recent_rows
+        ]
+        recent_density_changes = [
+            abs(row["max_physical_cell_density_change"])
+            for row in recent_rows
+        ]
+
+        finite_window = bool(
+            all(onp.isfinite(recent_relative_changes))
+            and all(onp.isfinite(recent_density_changes))
+        )
+
+        if finite_window:
+            maximum_recent_relative_change = float(
+                max(recent_relative_changes)
+            )
+            maximum_recent_density_change = float(
+                max(recent_density_changes)
+            )
+        else:
+            maximum_recent_relative_change = None
+            maximum_recent_density_change = None
+    else:
+        finite_window = False
+        maximum_recent_relative_change = None
+        maximum_recent_density_change = None
+
+    final_absolute_volume_error = float(
+        abs(history_data[-1]["heightfield_nodal_volume_error"])
+    )
+
+    compliance_converged = bool(
+        enough_history
+        and finite_window
+        and maximum_recent_relative_change
+        <= COMPLIANCE_RELATIVE_TOLERANCE
+    )
+    density_converged = bool(
+        enough_history
+        and finite_window
+        and maximum_recent_density_change
+        <= MAX_PHYSICAL_DENSITY_CHANGE_TOLERANCE
+    )
+    volume_converged = bool(
+        final_absolute_volume_error
+        <= VOLUME_ABSOLUTE_TOLERANCE
+    )
+
+    converged = bool(
+        compliance_converged
+        and density_converged
+        and volume_converged
+    )
+
+    return {
+        "converged": converged,
+        "enough_history": enough_history,
+        "minimum_iterations": MINIMUM_ITERATIONS,
+        "window_length": CONVERGENCE_WINDOW,
+        "criteria": {
+            "maximum_recent_relative_compliance_change":
+                COMPLIANCE_RELATIVE_TOLERANCE,
+            "maximum_recent_physical_cell_density_change":
+                MAX_PHYSICAL_DENSITY_CHANGE_TOLERANCE,
+            "final_absolute_heightfield_nodal_volume_error":
+                VOLUME_ABSOLUTE_TOLERANCE,
+        },
+        "observed": {
+            "maximum_recent_relative_compliance_change":
+                maximum_recent_relative_change,
+            "maximum_recent_physical_cell_density_change":
+                maximum_recent_density_change,
+            "final_absolute_heightfield_nodal_volume_error":
+                final_absolute_volume_error,
+        },
+        "individual_checks": {
+            "compliance_converged": compliance_converged,
+            "physical_density_converged": density_converged,
+            "volume_converged": volume_converged,
+        },
+    }
+
+
+def write_history_xlsx(path, history_data):
+    """
+    Save iteration history as a real .xlsx file if openpyxl is available.
+
+    If openpyxl is not installed on the machine, this function quietly
+    skips .xlsx output.
+    """
+
+    if len(history_data) == 0:
+        return
+
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        print(
+            "openpyxl is not installed; skipped .xlsx history output.",
+            flush=True,
+        )
+        return
+
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "heightfield_history"
+
+    headers = list(history_data[0].keys())
+    worksheet.append(headers)
+
+    for row in history_data:
+        worksheet.append([row[key] for key in headers])
+
+    workbook.save(path)
+
+
+
+def save_history_plot(
+    history_data,
+    key,
+    ylabel,
+    title,
+    output_path,
+):
+    """
+    Save a convergence plot for one quantity in the iteration history.
+    """
+
+    if len(history_data) == 0:
+        return
+
+    iterations = [row["iteration"] for row in history_data]
+    values = [row[key] for row in history_data]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    ax.plot(iterations, values)
+
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+
+    fig.savefig(
+        output_path,
+        dpi=220,
+        bbox_inches="tight",
+    )
+
+    plt.close(fig)
+
+
+
+
+
+# ============================================================
+# 9. Main optimisation function
+# ============================================================
+
+def run_cantilever_six_height_sto():
+    global history
+    history = []
+
+    vtk_dir = os.path.join(
+        OUTPUT_DIR,
+        "vtk",
+    )
+
+    if CLEAR_OLD_RESULTS and os.path.exists(OUTPUT_DIR):
+        shutil.rmtree(OUTPUT_DIR)
+
+    os.makedirs(
+        vtk_dir,
+        exist_ok=True,
+    )
+
+    settings = {
+        "run_name": RUN_NAME,
+        "unit_system": "N-mm-MPa",
+        "comparison_source": "supplied SIMP baseline attachment",
+        "mesh": {
+            "NX": NX,
+            "NY": NY,
+            "NZ": NZ,
+            "LX_mm": LX,
+            "LY_mm": LY,
+            "LZ_mm": LZ,
+            "DX_mm": DX,
+            "DY_mm": DY,
+            "DZ_mm": DZ,
+        },
+        "material": {
+            "E_max_MPa": E_MAX,
+            "void_stiffness_ratio": VOID_STIFFNESS_RATIO,
+            "E_min_MPa": E_MIN,
+            "poisson_ratio": POISSON_RATIO,
+            "SIMP_penalty": P_SIMP,
+        },
+        "load": {
+            "total_y_load_N": TOTAL_APPLIED_LOAD_Y,
+            "load_strip_height_mm": LOAD_STRIP_HEIGHT,
+        },
+        "optimisation": {
+            "heightfield_nodal_volume_target": VOL_TARGET,
+            "all_height_fields": list(ALL_HEIGHT_FIELD_NAMES),
+            "active_height_fields": list(ACTIVE_HEIGHT_FIELDS),
+            "inactive_height_fields": list(INACTIVE_HEIGHT_FIELDS),
+            "number_of_active_height_fields": len(ACTIVE_HEIGHT_FIELDS),
+            "number_of_active_design_variables": (
+                get_num_active_design_variables()
+            ),
+            "maximum_MMA_updates": NUM_ITERATIONS,
+            "normalised_MMA_move_limit": MMA_MOVE_LIMIT,
+            "internal_height_variable_units": "original nondimensional units",
+            "design_to_mm": DESIGN_TO_MM,
+            "internal_height_lower_bound": INITIAL_HEIGHT,
+            "internal_height_upper_bound": MAX_DESIGN_DEPTH,
+            "height_density_beta_per_mm": BETA,
+            "initialisation": "solid stock: all height fields at no-cut lower bound",
+            "non_design_regions": False,
+            "convergence": {
+                "early_stopping_enabled": EARLY_STOPPING_ENABLED,
+                "minimum_iterations": MINIMUM_ITERATIONS,
+                "window_length": CONVERGENCE_WINDOW,
+                "relative_compliance_tolerance":
+                    COMPLIANCE_RELATIVE_TOLERANCE,
+                "maximum_physical_cell_density_change_tolerance":
+                    MAX_PHYSICAL_DENSITY_CHANGE_TOLERANCE,
+                "absolute_heightfield_nodal_volume_error_tolerance":
+                    VOLUME_ABSOLUTE_TOLERANCE,
+            },
+        },
+        "height_filter": {
+            "enabled": USE_HEIGHT_FIELD_FILTER,
+            "type": "original separable 2D Gaussian",
+            "sigma_cells": GAUSSIAN_FILTER_SIGMA_CELLS,
+            "half_width_cells": GAUSSIAN_FILTER_RADIUS_CELLS,
+            "sigma_mm": GAUSSIAN_FILTER_SIGMA_MM,
+            "half_width_mm": GAUSSIAN_FILTER_RADIUS_MM,
+            "comparison_note": (
+                "This preserves the proposed method's original height-field "
+                "regularisation and is not equal to the SIMP 3D cone filter."
+            ),
+        },
+        "tool": {
+            "ball_end_enabled": USE_BALL_END_CUTTER,
+            "diameter_mm": TOOL_DIAMETER_MM,
+            "radius_mm": TOOL_RADIUS,
+            "maximum_tip_insertion_depth_mm": MAX_INSERTION_DEPTH,
+            "maximum_ball_centre_depth_mm": MAX_DESIGN_DEPTH_MM,
+            "neck_length_mm": TOOL_NECK_LENGTH,
+            "holder_collision_enabled": USE_HOLDER_COLLISION,
+            "holder_envelope_x_mm": HOLDER_SIZE_X,
+            "holder_envelope_y_mm": HOLDER_SIZE_Y,
+            "holder_envelope_z_mm": HOLDER_SIZE_Z,
+            "status": "provisional; confirm against actual CNC tooling",
+        },
+    }
+
+    with open(
+        os.path.join(OUTPUT_DIR, "heightfield_run_settings.json"),
+        "w",
+        encoding="utf-8",
+    ) as settings_file:
+        json.dump(settings, settings_file, indent=2)
+
+    print(
+        "Saving results to:",
+        OUTPUT_DIR,
+        flush=True,
+    )
+
+    print(
+        "VTU files will be saved in:",
+        vtk_dir,
+        flush=True,
+    )
+
+    print(
+        "Height-field plots will be saved in:",
+        vtk_dir,
+        flush=True,
+    )
+
+    # --------------------------------------------------------
+    # Mesh
+    # --------------------------------------------------------
+
+    mesh_io = box_mesh(
+        NX,
+        NY,
+        NZ,
+        LX,
+        LY,
+        LZ,
+    )
+
+    mesh = Mesh(
+        mesh_io.points,
+        mesh_io.cells_dict["hexahedron"],
+        ele_type="HEX8",
+    )
+
+    points = jnp.asarray(mesh.points)
+
+    cells = jnp.asarray(
+        mesh.cells,
+        dtype=jnp.int32,
+    )
+
+    # --------------------------------------------------------
+    # Boundary conditions
+    # --------------------------------------------------------
+
+    def loc_clamp(x):
+        return jnp.isclose(
+            x[0],
+            0.0,
+            atol=1e-5,
+        )
+
+    def zero_displacement(x):
+        del x
+        return 0.0
+
+    dirichlet_bc = [
+        [loc_clamp, loc_clamp, loc_clamp],
+        [0, 1, 2],
+        [
+            zero_displacement,
+            zero_displacement,
+            zero_displacement,
+        ],
+    ]
+
+    # Load is applied on the lower strip of x = LX face.
+    def loc_load(x):
+        return jnp.logical_and(
+            jnp.isclose(
+                x[0],
+                LX,
+                atol=1e-5,
+            ),
+            x[1] <= LOAD_STRIP_HEIGHT + 1e-5,
+        )
+
+    def surface_map(u, x):
+        """
+        JAX-FEM surface-map sign convention.
+
+        The actual physical traction used in the compliance integral is:
+            t_physical = -surface_map
+
+        Therefore, for a downward physical load:
+            TOTAL_APPLIED_LOAD_Y < 0
+
+        surface_map must return a positive y component.
+        """
+
+        del u, x
+
+        loaded_area = LOAD_STRIP_HEIGHT * LZ
+
+        return jnp.array(
+            [
+                0.0,
+                -TOTAL_APPLIED_LOAD_Y / loaded_area,
+                0.0,
+            ]
+        )
+
+    # --------------------------------------------------------
+    # FEM problem
+    # --------------------------------------------------------
+
+    problem = DensityElasticity(
+        mesh,
+        vec=3,
+        dim=3,
+        ele_type="HEX8",
+        dirichlet_bc_info=dirichlet_bc,
+        location_fns=[loc_load],
+        surface_maps=[surface_map],
+    )
+
+    fwd_solver = ad_wrapper(
+        problem,
+        solver_options={
+            "spsolve_solver": {}
+        },
+        adjoint_solver_options={
+            "spsolve_solver": {}
+        },
+    )
+
+    # --------------------------------------------------------
+    # Design-to-density mapping
+    # --------------------------------------------------------
+
+    def get_rho_nodes(x_flat):
+        h_fields = get_height_fields_for_density(x_flat)
+
+        return compute_density_from_six_height_fields(
+            h_fields,
+            points,
+        )
+
+    def get_rho_cells(rho_nodes):
+        return jnp.mean(
+            rho_nodes[cells],
+            axis=1,
+        )
+
+    # --------------------------------------------------------
+    # Objective and volume constraint
+    # --------------------------------------------------------
+
+    def get_compliance(x_flat):
+        rho_nodes = get_rho_nodes(x_flat)
+
+        rho_cells = get_rho_cells(rho_nodes)
+
+        u = fwd_solver(
+            rho_cells[:, None]
+        )[0]
+
+        # Standard compliance definition, matching SIMP baseline.
+        return problem.compute_compliance(u)
+
+    def get_volume(x_flat):
+        """
+        Preserve the original height-field volume constraint:
+
+            mean(rho_nodes) - VOL_TARGET <= 0.
+        """
+
+        return jnp.mean(get_rho_nodes(x_flat)) - VOL_TARGET
+
+    grad_obj = jax.value_and_grad(
+        get_compliance
+    )
+
+    grad_con = jax.value_and_grad(
+        get_volume
+    )
+
+    # --------------------------------------------------------
+    # Initialise MMA
+    # --------------------------------------------------------
+
+    xmin, xmax = create_design_bounds()
+
+    # Cheap monotonic feasibility pre-check.  Setting every active field to its
+    # upper bound gives the maximum removal permitted by the selected faces,
+    # tool geometry, holder setting and insertion-depth limit.  If even this
+    # design cannot reach the requested volume, the MMA problem is infeasible.
+    maximum_cut_design = jnp.asarray(xmax)
+    minimum_reachable_nodal_volume = float(
+        jnp.mean(get_rho_nodes(maximum_cut_design))
+    )
+    minimum_reachable_cell_volume = float(
+        jnp.mean(
+            get_rho_cells(
+                get_rho_nodes(maximum_cut_design)
+            )
+        )
+    )
+
+    volume_target_feasible = bool(
+        minimum_reachable_nodal_volume
+        <= VOL_TARGET + VOLUME_ABSOLUTE_TOLERANCE
+    )
+
+    settings["optimisation"]["volume_feasibility_precheck"] = {
+        "feasible": volume_target_feasible,
+        "minimum_reachable_nodal_volume_fraction": (
+            minimum_reachable_nodal_volume
+        ),
+        "minimum_reachable_cell_volume_fraction": (
+            minimum_reachable_cell_volume
+        ),
+        "target_nodal_volume_fraction": VOL_TARGET,
+        "tolerance": VOLUME_ABSOLUTE_TOLERANCE,
+    }
+
+    with open(
+        os.path.join(OUTPUT_DIR, "heightfield_run_settings.json"),
+        "w",
+        encoding="utf-8",
+    ) as settings_file:
+        json.dump(settings, settings_file, indent=2)
+
+    if not volume_target_feasible:
+        raise ValueError(
+            "The selected height-field combination cannot reach the requested "
+            f"nodal volume target {VOL_TARGET:.6f}. With every active field "
+            "at its maximum permitted depth, the minimum reachable nodal "
+            f"volume is {minimum_reachable_nodal_volume:.6f}. Active fields: "
+            + ", ".join(ACTIVE_HEIGHT_FIELDS)
+            + ". Increase the available insertion depth, enable additional "
+            "directions, or choose a feasible volume target."
+        )
+
+    # Preserve the original subtractive initialisation: every cutter-centre
+    # field starts at the no-cut lower bound, representing the solid stock.
+    curr_x_np = onp.asarray(
+        initialise_design_variables(),
+        dtype=float,
+    )
+
+    settings["optimisation"][
+        "solid_stock_initial_height_mm"
+    ] = INITIAL_HEIGHT_MM
+
+    with open(
+        os.path.join(OUTPUT_DIR, "heightfield_run_settings.json"),
+        "w",
+        encoding="utf-8",
+    ) as settings_file:
+        json.dump(settings, settings_file, indent=2)
+
+    L = curr_x_np - 0.5 * (
+        xmax - xmin
+    )
+
+    U = curr_x_np + 0.5 * (
+        xmax - xmin
+    )
+
+    x_old_np = curr_x_np.copy()
+    x_older_np = curr_x_np.copy()
+
+    print(
+        "Starting selectable-height-field STO in N-mm-MPa units with matched SIMP problem parameters...",
+        flush=True,
+    )
+
+    print(
+        "Active height fields:",
+        ", ".join(ACTIVE_HEIGHT_FIELDS),
+        "| Inactive:",
+        ", ".join(INACTIVE_HEIGHT_FIELDS) if INACTIVE_HEIGHT_FIELDS else "none",
+        flush=True,
+    )
+
+    print(
+        "Height-field filter:", USE_HEIGHT_FIELD_FILTER,
+        "| Ball-end cutter:", USE_BALL_END_CUTTER,
+        "| Holder collision:", USE_HOLDER_COLLISION,
+        flush=True,
+    )
+
+    print(
+        "Mesh:",
+        f"{NX} x {NY} x {NZ}",
+        f"| element = {DX:.3f} x {DY:.3f} x {DZ:.3f} mm",
+        flush=True,
+    )
+
+    print(
+        "Cutter: ",
+        f"diameter = {TOOL_DIAMETER_MM:.3f} mm | ",
+        f"maximum tip depth = {MAX_INSERTION_DEPTH:.3f} mm | ",
+        f"neck length = {TOOL_NECK_LENGTH:.3f} mm",
+        flush=True,
+    )
+
+    print(
+        "Solid-stock initial height = "
+        f"{INITIAL_HEIGHT:.6f} design units = "
+        f"{INITIAL_HEIGHT_MM:.6f} mm (no cut)",
+        flush=True,
+    )
+
+    print(
+        "Number of design variables:",
+        len(curr_x_np),
+        flush=True,
+    )
+
+    initial_rho_nodes = get_rho_nodes(
+        jnp.asarray(curr_x_np)
+    )
+    initial_rho_cells = get_rho_cells(initial_rho_nodes)
+    previous_rho_cells_np = onp.asarray(
+        initial_rho_cells,
+        dtype=float,
+    ).reshape(-1)
+
+    completed_iterations = 0
+    termination_reason = "maximum_iterations"
+    convergence_summary = assess_convergence(history)
+
+    checkpoint_path = os.path.join(
+        OUTPUT_DIR,
+        "heightfield_mma_checkpoint_latest.npz",
+    )
+    convergence_live_path = os.path.join(
+        OUTPUT_DIR,
+        "heightfield_convergence_live.json",
+    )
+
+    print(
+        "Initial volume fractions | "
+        f"nodal = {float(jnp.mean(initial_rho_nodes)):.6f} | "
+        f"cell = {float(jnp.mean(initial_rho_cells)):.6f} | "
+        f"target = {VOL_TARGET:.3f}",
+        flush=True,
+    )
+
+    # --------------------------------------------------------
+    # Optimisation loop
+    # --------------------------------------------------------
+
+    for it in range(NUM_ITERATIONS):
+        x_jnp = jnp.asarray(curr_x_np)
+
+        f0, df0 = grad_obj(x_jnp)
+        f1, df1 = grad_con(x_jnp)
+
+        f0_val = float(f0)
+        f1_val = float(f1)
+
+        df0_np = onp.asarray(
+            df0,
+            dtype=float,
+        )
+
+        df1_np = onp.asarray(
+            df1,
+            dtype=float,
+        )
+
+        L, U = update_asymptotes(
+            it,
+            curr_x_np,
+            x_old_np,
+            x_older_np,
+            L,
+            U,
+            xmin,
+            xmax,
+        )
+
+        x_new_np = mma_subproblem(
+            curr_x_np,
+            f0_val,
+            df0_np,
+            f1_val,
+            df1_np,
+            xmin,
+            xmax,
+            L,
+            U,
+            move=MMA_MOVE_LIMIT,
+        )
+
+        change = onp.max(
+            onp.abs(
+                x_new_np - curr_x_np
+            )
+        )
+
+        x_older_np = x_old_np.copy()
+        x_old_np = curr_x_np.copy()
+        curr_x_np = x_new_np.copy()
+
+        # ----------------------------------------------------
+        # Save current iteration
+        # ----------------------------------------------------
+
+        rho_nodes = get_rho_nodes(
+            jnp.asarray(curr_x_np)
+        )
+
+        rho_cells = get_rho_cells(rho_nodes)
+
+        u = fwd_solver(
+            rho_cells[:, None]
+        )[0]
+
+        # Use the objective of the UPDATED design saved below.  The original
+        # script logged f0_val from the pre-update design next to the post-update
+        # volume and VTU, which shifted the histories by one state.
+        updated_compliance = float(
+            problem.compute_compliance(u)
+        )
+
+        rho_cells_np = onp.asarray(
+            rho_cells,
+            dtype=float,
+        ).reshape(-1)
+
+        relative_compliance_change = float(
+            abs(updated_compliance - f0_val)
+            / max(abs(f0_val), 1.0e-12)
+        )
+        max_physical_density_change = float(
+            onp.max(
+                onp.abs(
+                    rho_cells_np - previous_rho_cells_np
+                )
+            )
+        )
+
+        save_vtu(
+            os.path.join(
+                vtk_dir,
+                f"cantilever_6hf_iter_{it + 1:03d}.vtu",
+            ),
+            mesh,
+            mesh_io,
+            rho_nodes,
+            rho_cells,
+            u,
+        )
+
+        save_height_fields_plot(
+            vtk_dir,
+            it + 1,
+            jnp.asarray(curr_x_np),
+        )
+
+        # Record the volume of the updated design that was just saved.
+        nodal_volume_fraction = float(jnp.mean(rho_nodes))
+        cell_volume_fraction = float(jnp.mean(rho_cells))
+        updated_constraint_value = nodal_volume_fraction - VOL_TARGET
+
+        change_mm = float(DESIGN_TO_MM * change)
+
+        history.append({
+            "iteration": it + 1,
+            "compliance_N_mm": updated_compliance,
+            "nodal_volume_fraction": nodal_volume_fraction,
+            "cell_volume_fraction": cell_volume_fraction,
+            "physical_cell_volume_error": (
+                cell_volume_fraction - VOL_TARGET
+            ),
+            "heightfield_nodal_volume_error": updated_constraint_value,
+            "heightfield_volume_constraint": updated_constraint_value,
+            "max_design_change_nondimensional": float(change),
+            "max_height_change_mm": change_mm,
+            "relative_compliance_change": relative_compliance_change,
+            "max_physical_cell_density_change":
+                max_physical_density_change,
+            "height_field_filter": USE_HEIGHT_FIELD_FILTER,
+            "ball_end_cutter": USE_BALL_END_CUTTER,
+            "holder_collision": USE_HOLDER_COLLISION,
+            "tool_diameter_mm": TOOL_DIAMETER_MM,
+            "tool_radius_mm": TOOL_RADIUS,
+            "max_insertion_depth_mm": MAX_INSERTION_DEPTH,
+            "tool_neck_length_mm": TOOL_NECK_LENGTH,
+        })
+
+        completed_iterations = it + 1
+        convergence_summary = assess_convergence(history)
+
+        history[-1]["converged"] = convergence_summary["converged"]
+        history[-1]["compliance_window_converged"] = (
+            convergence_summary["individual_checks"].get(
+                "compliance_converged",
+                False,
+            )
+        )
+        history[-1]["physical_density_window_converged"] = (
+            convergence_summary["individual_checks"].get(
+                "physical_density_converged",
+                False,
+            )
+        )
+        history[-1]["volume_converged"] = (
+            convergence_summary["individual_checks"].get(
+                "volume_converged",
+                False,
+            )
+        )
+
+        write_history_csv(
+            os.path.join(
+                OUTPUT_DIR,
+                "heightfield_history_live.csv",
+            ),
+            history,
+        )
+
+        save_mma_checkpoint(
+            checkpoint_path,
+            completed_iterations,
+            curr_x_np,
+            x_old_np,
+            x_older_np,
+            L,
+            U,
+            rho_cells_np,
+            updated_compliance,
+        )
+
+        convergence_live_payload = dict(convergence_summary)
+        convergence_live_payload["progress"] = {
+            "completed_MMA_updates": completed_iterations,
+            "maximum_MMA_updates": NUM_ITERATIONS,
+            "status": "converged" if convergence_summary["converged"] else "running",
+            "latest_checkpoint": checkpoint_path,
+        }
+        write_json_atomic(
+            convergence_live_path,
+            convergence_live_payload,
+        )
+
+        print(
+            f"Iter {it + 1:03d} | "
+            f"Compliance: {updated_compliance:.6e} N*mm | "
+            f"CellVol: {cell_volume_fraction:.6f} | "
+            f"NodalVol: {nodal_volume_fraction:.6f} | "
+            f"NodalVolErr: {nodal_volume_fraction - VOL_TARGET:+.6f} | "
+            f"CellVolErr: {cell_volume_fraction - VOL_TARGET:+.6f} | "
+            f"RelC: {relative_compliance_change:.3e} | "
+            f"MaxDrhoPhys: {max_physical_density_change:.3e} | "
+            f"HeightChange: {change_mm:.6e} mm "
+            f"({change:.6e} design units)",
+            flush=True,
+        )
+
+        previous_rho_cells_np = rho_cells_np.copy()
+
+        if (
+            EARLY_STOPPING_ENABLED
+            and convergence_summary["converged"]
+        ):
+            termination_reason = "convergence_criteria"
+            print(
+                "Early stopping: all convergence criteria were satisfied "
+                f"for the latest {CONVERGENCE_WINDOW} updates at "
+                f"iteration {completed_iterations}.",
+                flush=True,
+            )
+            break
+
+    # --------------------------------------------------------
+    # Save final result
+    # --------------------------------------------------------
+
+    final_x = jnp.asarray(curr_x_np)
+
+    rho_nodes = get_rho_nodes(final_x)
+    rho_cells = get_rho_cells(rho_nodes)
+
+    u = fwd_solver(
+        rho_cells[:, None]
+    )[0]
+
+    final_vtu_path = os.path.join(
+        vtk_dir,
+        "cantilever_6hf_final.vtu",
+    )
+
+    save_vtu(
+        final_vtu_path,
+        mesh,
+        mesh_io,
+        rho_nodes,
+        rho_cells,
+        u,
+    )
+
+    save_height_fields_plot(
+        vtk_dir,
+        completed_iterations,
+        final_x,
+    )
+
+    final_compliance = float(problem.compute_compliance(u))
+    final_nodal_volume = float(jnp.mean(rho_nodes))
+    final_cell_volume = float(jnp.mean(rho_cells))
+    final_maximum_displacement = float(
+        onp.max(
+            onp.linalg.norm(
+                onp.asarray(u, dtype=float),
+                axis=1,
+            )
+        )
+    )
+    final_rho_cells_np = onp.asarray(
+        rho_cells,
+        dtype=float,
+    ).reshape(-1)
+    final_grey_index = float(
+        onp.mean(
+            4.0 * final_rho_cells_np * (1.0 - final_rho_cells_np)
+        )
+    )
+    final_grey_fraction = float(
+        onp.mean(
+            onp.logical_and(
+                final_rho_cells_np > 0.1,
+                final_rho_cells_np < 0.9,
+            )
+        )
+    )
+
+    final_summary = {
+        "termination_reason": termination_reason,
+        "completed_MMA_updates": completed_iterations,
+        "maximum_MMA_updates": NUM_ITERATIONS,
+        "early_stopping_enabled": EARLY_STOPPING_ENABLED,
+        "compliance_N_mm": final_compliance,
+        "physical_cell_volume_fraction": final_cell_volume,
+        "physical_cell_volume_error": final_cell_volume - VOL_TARGET,
+        "heightfield_nodal_volume_fraction": final_nodal_volume,
+        "heightfield_nodal_volume_error": final_nodal_volume - VOL_TARGET,
+        "volume_constraint_type": "mean(rho_nodes) - VOL_TARGET <= 0",
+        "maximum_displacement_mm": final_maximum_displacement,
+        "cell_grey_index": final_grey_index,
+        "cell_grey_fraction_0p1_to_0p9": final_grey_fraction,
+        "final_vtu": final_vtu_path,
+        "latest_MMA_checkpoint": checkpoint_path,
+        "convergence": convergence_summary,
+    }
+
+    write_json_atomic(
+        os.path.join(OUTPUT_DIR, "heightfield_final_summary.json"),
+        final_summary,
+    )
+
+    final_convergence_payload = dict(convergence_summary)
+    final_convergence_payload["progress"] = {
+        "completed_MMA_updates": completed_iterations,
+        "maximum_MMA_updates": NUM_ITERATIONS,
+        "status": "finished",
+        "termination_reason": termination_reason,
+        "latest_checkpoint": checkpoint_path,
+    }
+    write_json_atomic(
+        convergence_live_path,
+        final_convergence_payload,
+    )
+
+    # Save Excel history and convergence plots.
+    if len(history) > 0:
+        write_history_xlsx(
+            os.path.join(
+                OUTPUT_DIR,
+                "heightfield_history.xlsx",
+            ),
+            history,
+        )
+
+        save_history_plot(
+            history,
+            "compliance_N_mm",
+            "Compliance (N mm)",
+            "Height-field STO compliance versus iteration",
+            os.path.join(
+                OUTPUT_DIR,
+                "heightfield_compliance_vs_iteration.png",
+            ),
+        )
+
+        save_history_plot(
+            history,
+            "cell_volume_fraction",
+            "Cell volume fraction",
+            "Height-field STO cell volume fraction versus iteration",
+            os.path.join(
+                OUTPUT_DIR,
+                "heightfield_volume_vs_iteration.png",
+            ),
+        )
+
+        save_history_plot(
+            history,
+            "max_height_change_mm",
+            "Maximum height-field change (mm)",
+            "Height-field STO maximum physical design change versus iteration",
+            os.path.join(
+                OUTPUT_DIR,
+                "heightfield_change_vs_iteration.png",
+            ),
+        )
+
+        save_history_plot(
+            history,
+            "relative_compliance_change",
+            "Relative compliance change",
+            "Height-field STO relative compliance change",
+            os.path.join(
+                OUTPUT_DIR,
+                "heightfield_relative_compliance_change.png",
+            ),
+        )
+
+        save_history_plot(
+            history,
+            "max_physical_cell_density_change",
+            "Maximum physical cell-density change",
+            "Height-field STO maximum physical density change",
+            os.path.join(
+                OUTPUT_DIR,
+                "heightfield_physical_density_change.png",
+            ),
+        )
+
+    print(
+        "Optimisation finished.",
+        flush=True,
+    )
+
+    print(
+        f"Termination: {termination_reason} | "
+        f"completed updates: {completed_iterations}/{NUM_ITERATIONS}",
+        flush=True,
+    )
+
+    print(
+        f"Final compliance: {final_compliance:.6e} N*mm",
+        flush=True,
+    )
+
+    print(
+        f"Final nodal volume fraction: {final_nodal_volume:.6f}",
+        flush=True,
+    )
+
+    print(
+        f"Final cell volume fraction: {final_cell_volume:.6f}",
+        flush=True,
+    )
+
+    print(
+        "Saved final VTU:",
+        final_vtu_path,
+        flush=True,
+    )
+
+    print(
+        "Saved final height field plot:",
+        os.path.join(
+            vtk_dir,
+            f"height_fields_iter_{completed_iterations:03d}.png",
+        ),
+        flush=True,
+    )
+
+
+if __name__ == "__main__":
+    run_cantilever_six_height_sto()
